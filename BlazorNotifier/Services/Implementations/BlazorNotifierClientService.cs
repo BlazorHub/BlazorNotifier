@@ -14,6 +14,8 @@ namespace BlazorNotifier.Services.Implementations
 {
     public class BlazorNotifierClientService
     {
+        private readonly string _ServerAddress;
+
         #region События
 
         /// <summary> Событие при изменениях в сервисе </summary>
@@ -29,15 +31,18 @@ namespace BlazorNotifier.Services.Implementations
         #endregion
 
         /// <summary> Конструктор с инициализатором сервиса </summary>
-        public BlazorNotifierClientService()
+        public BlazorNotifierClientService(INotifierServiceOptions options)
         {
-            ConnectToServerAsync();
+            _ServerAddress = options.ServiceAddress+$"/{options.HubName}";
+            if(string.IsNullOrWhiteSpace(options.ServiceAddress))
+                SetNotifications();
+            else
+                ConnectToServerAsync();
         }
         #region Notification
         /// <summary> Словарь событий время/сообщение </summary>
-        public Dictionary<Guid, (DateTime date,string message)> Events = new Dictionary<Guid, (DateTime date, string message)>();
+        public Dictionary<DateTime, BlazorNotifierMessage> Events { get; }= new Dictionary<DateTime, BlazorNotifierMessage>();
         /// <summary> адрес сервиса api </summary>
-        string Url = "https://localhost:44303/notificationhub";
         /// <summary> Коллекция уведомительных сообщений </summary>
         public Notifications Notification { get; }= new Notifications();
 
@@ -46,10 +51,16 @@ namespace BlazorNotifier.Services.Implementations
         HubConnection _Connection = null;
         /// <summary> Id клиента для отправки сообщений </summary>
         public string UserId => _Connection.ConnectionId;
-        /// <summary> стиль статуса подключения к сервису </summary>
+
 
         #region Состояния подключения к сервису
-        public string StatusColor { get; set; } = "background-color: red; width: 20px; height: 20px; border-radius: 50%";
+
+        /// <summary> стиль статуса при подключенном состоянии </summary>
+        public static string StatusStyleOnOpen { get; set; } = "background-color: green; width: 20px; height: 20px; border-radius: 50%";
+        /// <summary> стиль статуса при отсутствии соединения </summary>
+        public static string StatusStyleOnClose { get; set; } = "background-color: red; width: 20px; height: 20px; border-radius: 50%";
+        /// <summary> стиль статуса подключения к сервису </summary>
+        public string StatusStyle { get; set; } = StatusStyleOnClose;
 
         private bool _IsConnected;
         /// <summary> состояния подключения к сервису </summary>
@@ -59,7 +70,7 @@ namespace BlazorNotifier.Services.Implementations
             set
             {
                 _IsConnected = value;
-                StatusColor = value ? "background-color: green; width: 20px; height: 20px; border-radius: 50%" : "background-color: red; width: 20px; height: 20px; border-radius: 50%";
+                StatusStyle = value ? StatusStyleOnOpen : StatusStyleOnClose;
                 NotifyConnectionChanged();
                 NotifyChanged();
             }
@@ -83,15 +94,21 @@ namespace BlazorNotifier.Services.Implementations
 
         #endregion
 
-        /// <summary> Подключение к серверу </summary>
-        private async void ConnectToServerAsync()
+        private void SetNotifications()
         {
             //Добавляя новое сообщение в коллекцию - записываем сообщение в события
             Notification.OnChange += NotifyChanged;
-            Notification.OnAddNewMessage += StartNotifierTimer;
+            Notification.OnAddNewMessage += async m => await StartNotifierTimer(m);
+
+        }
+
+        /// <summary> Подключение к серверу </summary>
+        private async void ConnectToServerAsync()
+        {
+            SetNotifications();
 
             _Connection = new HubConnectionBuilder()
-                .WithUrl(Url)
+                .WithUrl(_ServerAddress)
                 .Build();
 
             await _Connection.StartAsync();
@@ -100,12 +117,13 @@ namespace BlazorNotifier.Services.Implementations
             ConnectionStatus = "Connected";
 
             //автоматически присоединяемся к серверу при разъединении
-            _Connection.Closed += OnConnectionClosed;
+            _Connection.Closed += async m => await OnConnectionClosed(m);
             //выполняем при получении сообщений клиентом
-            _Connection.On<BlazorNotifierMessage>("notification", DoWhenClientGetNewMessage);
+            _Connection.On<BlazorNotifierMessage>("notification", async m=>await DoWhenClientGetNewMessage(m));
+            _Connection.On<BlazorNotifierMessage>("Log", DoWhenGetLogMessage);
             _Connection.On<BlazorNotifierProgressMessage>("ProgressFinish", DoWhenProgressFinish);
             _Connection.On<BlazorNotifierProgressMessage>("ProgressUpdate", DoWhenProgressUpdate);
-            _Connection.On<BlazorNotifierProgressMessage>("ProgressStart", DoWhenProgressStart);
+            _Connection.On<BlazorNotifierProgressMessage>("ProgressStart", async m => await DoWhenProgressStart(m));
         }
 
         /// <summary>
@@ -115,71 +133,44 @@ namespace BlazorNotifier.Services.Implementations
         /// <returns></returns>
         private async Task OnConnectionClosed(Exception s)
         {
+            await LogNotification($"Disconnect from server with message: {s.Message}");
             IsConnected = false;
             ConnectionStatus = "Disconnected";
+            Notification.ClearProgress();
             await _Connection.StartAsync();
             IsConnected = true;
             ConnectionStatus = "Connected";
         }
 
-        /// <summary> Запись событий </summary>
-        /// <param name="message">сообщение</param>
-        void LogNotification(BlazorNotifierMessage message)
-        {
-            Events.Add(message.Id,(message.Time, $"{message.Type} - {message.Title}"));
-            NotifyChanged();
-        }
+        #endregion
 
         #region PROGRESS
 
         private void DoWhenProgressUpdate(BlazorNotifierProgressMessage Message) => Notification.UpdateProgress(Message);
 
-        private void DoWhenProgressStart(BlazorNotifierProgressMessage Progress)
+        private async Task DoWhenProgressStart(BlazorNotifierProgressMessage Progress)
         {
             Notification.AddProgress(Progress);
-            LogNotification(new BlazorNotifierMessage { Title = $"{Progress.Title}: {Progress.Message}", Time = Progress.Time, 
-                Id = Progress.Id, Type = BlazorNotifierType.Progress });
+            await LogNotification(new BlazorNotifierMessage
+            {
+                Title = $"{Progress.Title}: {Progress.Message}",
+                Time = Progress.Time,
+                Id = Progress.Id,
+                Type = BlazorNotifierType.Progress
+            });
         }
 
         private void DoWhenProgressFinish(BlazorNotifierProgressMessage Progress) => Notification.RemoveProgress(Progress.Id);
-        public void CloseProgress(Guid id) => Notification.RemoveProgress(id);
-
-        #endregion
-
-        #region Messages
-
         /// <summary>
-        /// Выполняем при получении сообщений клиентом
+        /// Закрыть прогресс бар
         /// </summary>
-        /// <param name="message">сообщение</param>
-        private void DoWhenClientGetNewMessage(BlazorNotifierMessage message) => SendNotification(message);
-
-        public void CloseMessage(Guid id) => Notification.RemoveMessage(id);
-
-        #endregion
-
-        #endregion
-
-        #region Уведомления на клиенте
-
-        public void SendNotification(BlazorNotifierMessage message)
-        {
-            Notification.AddMessage(message);
-            LogNotification(message);
-        }
-        public void SendNotification(string text, BlazorNotifierType type = BlazorNotifierType.Info)
-        {
-            if (type == BlazorNotifierType.Debug)
-            {
-                Console.WriteLine($"Debug: {text}");
-                return;
-            }
-
-            var message = new BlazorNotifierMessage {Title = text, Type = type};
-            SendNotification(message);
-        }
-
-        public void SendOrUpdateProgress(BlazorNotifierProgressMessage progress)
+        /// <param name="id">id окна</param>
+        public void CloseProgress(Guid id) => Notification.RemoveProgress(id);
+        /// <summary>
+        /// показать прогресс или обновить данные
+        /// </summary>
+        /// <param name="progress">прогресс</param>
+        public async Task SendOrUpdateProgress(BlazorNotifierProgressMessage progress)
         {
             if (Notification.ContainsProgress(progress.Id))
             {
@@ -189,7 +180,7 @@ namespace BlazorNotifier.Services.Implementations
             else
             {
                 Notification.AddProgress(progress);
-                LogNotification(new BlazorNotifierMessage
+                await LogNotification(new BlazorNotifierMessage
                 {
                     Title = $"{progress.Title}: {progress.Message}",
                     Time = progress.Time,
@@ -201,9 +192,91 @@ namespace BlazorNotifier.Services.Implementations
         }
 
         #endregion
-        private void StartNotifierTimer(BlazorNotifierMessage message)
+
+        #region Messages
+
+        /// <summary>
+        /// Выполняем при получении сообщений клиентом
+        /// </summary>
+        /// <param name="message">сообщение</param>
+        private async Task DoWhenClientGetNewMessage(BlazorNotifierMessage message) => await SendNotification(message);
+        private async Task DoWhenGetLogMessage(BlazorNotifierMessage message) => await LogNotification(message);
+        /// <summary>
+        /// закрыть сообщение
+        /// </summary>
+        /// <param name="id">id сообщения</param>
+        public void CloseMessage(Guid id) => Notification.RemoveMessage(id);
+        /// <summary>
+        /// показать сообщение
+        /// </summary>
+        /// <param name="message">сообщение</param>
+        public async Task SendNotification(BlazorNotifierMessage message)
         {
-            Task.Run(async () =>
+            Notification.AddMessage(message);
+            await LogNotification(message);
+        }
+        /// <summary>
+        /// показать сообщение
+        /// </summary>
+        /// <param name="text">сообщение</param>
+        /// <param name="type">тип</param>
+        public async Task SendNotification(string text, BlazorNotifierType type = BlazorNotifierType.Info)
+        {
+            if (type == BlazorNotifierType.Debug)
+            {
+                Console.WriteLine($"Debug: {text}");
+                return;
+            }
+
+            var message = new BlazorNotifierMessage { Title = text, Type = type };
+            await SendNotification(message);
+        }
+
+        #endregion
+
+        #region Log
+
+        /// <summary> Запись событий </summary>
+        /// <param name="message">сообщение</param>
+        public async Task LogNotification(BlazorNotifierMessage message)
+        {
+            try
+            {
+                Events.Add(DateTime.Now, message);
+                NotifyChanged();
+            }
+            catch (ArgumentException)
+            {
+                await Task.Delay(1000);
+                await LogNotification(message);
+            }
+        }
+        /// <summary> Запись событий </summary>
+        /// <param name="text">сообщение</param>
+        /// <param name="type">тип события</param>
+        public async Task LogNotification(string text, BlazorNotifierType type = BlazorNotifierType.Info)
+        {
+            if (type == BlazorNotifierType.Debug)
+            {
+                Console.WriteLine($"Debug: {text}");
+                return;
+            }
+
+            var message = new BlazorNotifierMessage { Title = text, Type = type };
+            await LogNotification(message);
+        }
+
+
+        #endregion
+
+
+        /// <summary>
+        /// Удаляем сообщение из сервиса по окончанию таймера
+        /// </summary>
+        /// <param name="message">сообщения</param>
+        private async Task StartNotifierTimer(BlazorNotifierMessage message)
+        {
+            await Task.Run(async () =>
             {
                 await Task.Delay(message.TimeOut * 1000-1000 );
                 Notification.RemoveMessage(message);

@@ -5,7 +5,7 @@ namespace BlazorNotifier.Classes
 {
     public class BlazorNotifierProgress : Progress<(int? percent, string Title, string Message)>, IDisposable
     {
-        private readonly BlazorNotifierServerService _Service;
+        private readonly object _Service;
         private Guid ProgressID { get; }
         private string UserId { get; }
         private bool IsFirstMessage { get; set; } = true;
@@ -15,44 +15,57 @@ namespace BlazorNotifier.Classes
             UserId = userId;
             ProgressID = Guid.NewGuid();
         }
+        public BlazorNotifierProgress(string userId, BlazorNotifierServerService service)
+        {
+            UserId = userId;
+            ProgressID = Guid.NewGuid();
+            _Service = service;
+        }
+        public BlazorNotifierProgress(Action<(int? percent, string Title, string Message)> handler, BlazorNotifierClientService service) : base(handler)
+        {
+            _Service = service;
+            ProgressID = Guid.NewGuid();
+        }
+        public BlazorNotifierProgress(BlazorNotifierClientService service)
+        {
+            ProgressID = Guid.NewGuid();
+            _Service = service;
+        }
 
         #region Overrides of Progress<(int?,string,string)>
 
         protected override async void OnReport((int? percent, string Title, string Message) value)
         {
-            if (IsFirstMessage)
+            switch (_Service)
             {
-                await _Service.AddNewProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, UserId));
-                IsFirstMessage = false;
+                case BlazorNotifierServerService server when IsFirstMessage:
+                    IsFirstMessage = false;
+                    await server.AddNewProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, UserId));
+                    break;
+                case BlazorNotifierServerService server:
+                    await server.UpdateProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, UserId));
+                    break;
+                case BlazorNotifierClientService client: 
+                    await client.SendOrUpdateProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, client.UserId));
+                    break;
             }
-            else
-                await _Service.UpdateProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message , value.percent, UserId));
 
             base.OnReport(value);
         }
 
         #endregion
 
-        public async void Report((int? percent, string Title, string Message) value)
-        {
-            if (IsFirstMessage)
-            {
-                await _Service.AddNewProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, UserId));
-                IsFirstMessage = false;
-            }
-            await _Service.UpdateProgress(new BlazorNotifierProgressMessage(ProgressID, value.Title, value.Message, value.percent, UserId));
-            base.OnReport(value);
-        }
+        public void Report((int? percent, string Title, string Message) value)=> OnReport(value);
 
         public async void Dispose()
         {
-            await _Service.FinishProgress(new BlazorNotifierProgressMessage{ Id = ProgressID, ToUserId = UserId });
-        }
-        public BlazorNotifierProgress(string userId, BlazorNotifierServerService service)
-        {
-            UserId = userId;
-            ProgressID = Guid.NewGuid();
-            _Service = service;
+            switch (_Service)
+            {
+                case BlazorNotifierServerService server: await server.FinishProgress(new BlazorNotifierProgressMessage{ Id = ProgressID, ToUserId = UserId });
+                    break;
+                case BlazorNotifierClientService client: client.CloseProgress(ProgressID);
+                    break;
+            }
         }
 
     }
